@@ -22,7 +22,7 @@ import openai
 from database import (
     get_db, create_tables,
     User, ScheduleBooking, ChatSession, ChatMessage,
-    Worker, AdminUser, JobAssignment, WorkerSlot,
+    Worker, AdminUser, JobAssignment, WorkerSlot, SessionLocal,
 )
 from auth import (
     hash_password, verify_password, create_token,
@@ -192,67 +192,85 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 async def check_job_expiry():
-    """Background loop to mark missed slots as expired."""
+    """Background loop to mark missed slots as expired. (Only runs if not on Vercel)"""
+    if os.getenv("VERCEL"):
+        print("Vercel environment detected. Background loop disabled. Use /api/cron/check-expiry instead.")
+        return
+
     while True:
         try:
             # Run check every 1 minute
             await asyncio.sleep(60)
-            print("Checking for expired job windows...")
-            
-            # Using SessionLocal directly with a try/finally to ensure closure
-            db = SessionLocal()
-            try:
-                now = datetime.now() 
-                
-                # We only expire jobs that are assigned/claimed but not yet started
-                expired_candidates = (
-                    db.query(JobAssignment)
-                    .filter(JobAssignment.status.in_(["assigned", "claimed"]))
-                    .all()
-                )
-                
-                for a in expired_candidates:
-                    if not a.booking: continue
-                    
-                    try:
-                        date_str = a.booking.preferred_date
-                        time_str = a.booking.preferred_time
-                        
-                        if not date_str: continue
-                        
-                        # Handle flexible slots - expire at end of day
-                        if not time_str or any(x in time_str.lower() for x in ["flex", "asap"]):
-                            end_dt = datetime.strptime(f"{date_str} 11:59 PM", "%Y-%m-%d %I:%M %p")
-                        else:
-                            # "10:00 AM - 12:00 PM" -> "12:00 PM"
-                            end_part = time_str.split("-")[-1].strip()
-                            end_dt = datetime.strptime(f"{date_str} {end_part}", "%Y-%m-%d %I:%M %p")
-                        
-                        if now > end_dt:
-                            print(f"Job {a.id} expired! Window ended at {end_dt}")
-                            a.status = "expired"
-                            a.booking.status = "overdue"
-                            db.commit()
-                            
-                            # Real-time alert to admins
-                            await manager.broadcast_to_admins({
-                                "type": "job_status_update",
-                                "assignment": a.to_dict(),
-                                "message": f"Window missed for {a.booking.service}. Ticket marked as expired."
-                            })
-                    except Exception as parse_err:
-                        # Log but don't crash
-                        pass
-            except Exception as db_err:
-                print(f"Database Error in background task: {db_err}")
-            finally:
-                db.close()
-                    
+            await run_expiry_check()
         except asyncio.CancelledError:
             break
         except Exception as e:
             print(f"Background Task Error: {e}")
             await asyncio.sleep(5) # Cooldown before retry
+
+async def run_expiry_check():
+    """Internal function to run the actual expiry logic."""
+    print("Checking for expired job windows...")
+    
+    # Using SessionLocal directly with a try/finally to ensure closure
+    db = SessionLocal()
+    try:
+        now = datetime.now() 
+        
+        # We only expire jobs that are assigned/claimed but not yet started
+        expired_candidates = (
+            db.query(JobAssignment)
+            .filter(JobAssignment.status.in_(["assigned", "claimed"]))
+            .all()
+        )
+        
+        for a in expired_candidates:
+            if not a.booking: continue
+            
+            try:
+                date_str = a.booking.preferred_date
+                time_str = a.booking.preferred_time
+                
+                if not date_str: continue
+                
+                # Handle flexible slots - expire at end of day
+                if not time_str or any(x in time_str.lower() for x in ["flex", "asap"]):
+                    end_dt = datetime.strptime(f"{date_str} 11:59 PM", "%Y-%m-%d %I:%M %p")
+                else:
+                    # "10:00 AM - 12:00 PM" -> "12:00 PM"
+                    end_part = time_str.split("-")[-1].strip()
+                    end_dt = datetime.strptime(f"{date_str} {end_part}", "%Y-%m-%d %I:%M %p")
+                
+                if now > end_dt:
+                    print(f"Job {a.id} expired! Window ended at {end_dt}")
+                    a.status = "expired"
+                    a.booking.status = "overdue"
+                    db.commit()
+                    
+                    # Real-time alert to admins
+                    await manager.broadcast_to_admins({
+                        "type": "job_status_update",
+                        "assignment": a.to_dict(),
+                        "message": f"Window missed for {a.booking.service}. Ticket marked as expired."
+                    })
+            except Exception as parse_err:
+                # Log but don't crash
+                pass
+    except Exception as db_err:
+        print(f"Database Error in expiry check: {db_err}")
+    finally:
+        db.close()
+
+@app.get("/api/cron/check-expiry")
+async def cron_check_expiry(auth: Optional[str] = Query(None)):
+    """Vercel Cron endpoint to trigger expiry check."""
+    # Optional: check for a secret key to prevent unauthorized triggers
+    # CRON_SECRET = os.getenv("CRON_SECRET")
+    # if CRON_SECRET and auth != CRON_SECRET:
+    #     raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    await run_expiry_check()
+    return {"status": "success", "message": "Expiry check completed"}
 
 
 # ─── Startup ──────────────────────────────────────────────
