@@ -49,6 +49,7 @@ ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.st
     "https://custom-repair-workers.vercel.app",
     "https://custom-repair-frontend.vercel.app",
     "https://custom-repair-admin.vercel.app",
+    "https://custom-repair-client.vercel.app",
 ]
 
 app.add_middleware(
