@@ -92,8 +92,10 @@ class ScheduleBooking(Base):
             "service": self.service,
             "preferred_date": self.preferred_date,
             "preferred_time": self.preferred_time,
+            "notes": self.notes,
             "status": self.status,
             "slot_id": self.slot.id if self.slot else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
             "user": self.user.to_dict() if self.user else None,
         }
 
@@ -222,7 +224,7 @@ class JobAssignment(Base):
     worker_id = Column(String(36), ForeignKey("workers.id"), nullable=True)
     assigned_by = Column(String(36), nullable=True)   # AdminUser.id
 
-    # pending | assigned | claimed | rejected | in_progress | completed
+    # pending | assigned | claimed | rejected | in_progress | completed | not_completed | expired
     status = Column(String(30), default="pending")
 
     assigned_at = Column(DateTime, nullable=True)
@@ -243,6 +245,11 @@ class JobAssignment(Base):
             "worker_id": self.worker_id,
             "status": self.status,
             "assigned_at": self.assigned_at.isoformat() if self.assigned_at else None,
+            "accepted_at": self.accepted_at.isoformat() if self.accepted_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "worker_notes": self.worker_notes,
+            "worker": self.worker.to_dict() if self.worker else None,
             "booking": self.booking.to_dict() if self.booking else None,
         }
 
