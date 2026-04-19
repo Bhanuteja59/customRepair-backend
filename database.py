@@ -19,8 +19,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localho
 
 engine = create_engine(
     DATABASE_URL, 
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=300,
     pool_pre_ping=True,
-    pool_recycle=300, # Recycle connections every 5 minutes (well within Neon's limits)
     connect_args={"connect_timeout": 10}
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -82,7 +84,7 @@ class ScheduleBooking(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="bookings")
-    assignment = relationship("JobAssignment", back_populates="booking", uselist=False)
+    assignments = relationship("JobAssignment", back_populates="booking")
     slot = relationship("WorkerSlot", back_populates="booking", uselist=False)
 
     def to_dict(self):
@@ -218,7 +220,7 @@ class JobAssignment(Base):
     __tablename__ = "job_assignments"
 
     id = Column(String(36), primary_key=True, default=lambda: "JA-" + str(uuid.uuid4())[:8].upper())
-    booking_id = Column(String(36), ForeignKey("schedule_bookings.id"), nullable=False, unique=True)
+    booking_id = Column(String(36), ForeignKey("schedule_bookings.id"), nullable=False)
     worker_id = Column(String(36), ForeignKey("workers.id"), nullable=True)
     assigned_by = Column(String(36), nullable=True)   # AdminUser.id
 
@@ -233,7 +235,7 @@ class JobAssignment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    booking = relationship("ScheduleBooking", back_populates="assignment")
+    booking = relationship("ScheduleBooking", back_populates="assignments")
     worker = relationship("Worker", back_populates="assignments")
 
     def to_dict(self):

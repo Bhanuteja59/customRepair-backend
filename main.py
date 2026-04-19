@@ -13,14 +13,15 @@ from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 import openai
+import re
 
 from database import (
-    get_db, create_tables,
+    SessionLocal, get_db, create_tables,
     User, ScheduleBooking, ChatSession, ChatMessage,
     Worker, AdminUser, JobAssignment, WorkerSlot,
 )
@@ -366,6 +367,60 @@ def segment_to_2h(start_str: str, end_str: str):
         # Fallback if parsing fails
         yield f"{start_str} – {end_str}"
 
+def get_buffer_range(window_str: str):
+    """Returns (start_min - 120, end_min + 120) for adjacency checking."""
+    # "08:00 AM – 10:00 AM"
+    separators = ["-", "–", "—"]
+    for sep in separators:
+        if sep in window_str:
+            parts = window_str.split(sep)
+            s = parse_time_to_minutes(parts[0])
+            if len(parts) > 1:
+                e = parse_time_to_minutes(parts[1])
+                return s - 120, e + 120
+    # Single point
+    s = parse_time_to_minutes(window_str)
+    return s - 120, s + 120 + 60
+
+def is_window_conflict(target_window_str: str, occupied_windows: List[tuple]) -> bool:
+    """
+    Checks if a target 2h window conflicts with occupied windows or their adjacent buffers.
+    occupied_windows is a list of (start_min, end_min).
+    """
+    # Any job inside [start - 2h, end + 2h] counts as a conflict (Overlap + Adjacency)
+    buf_start, buf_end = get_buffer_range(target_window_str)
+    
+    for os, oe in occupied_windows:
+        # Standard overlap check between search buffer and occupied window
+        if buf_start < oe and buf_end > os:
+            return True
+    return False
+
+def get_occupied_minutes_for_worker(db: Session, worker_id: str, date: str) -> List[tuple]:
+    """Fetches all (start_min, end_min) for a worker's assigned jobs on a date."""
+    assignments = db.query(JobAssignment).join(ScheduleBooking).filter(
+        JobAssignment.worker_id == worker_id,
+        ScheduleBooking.preferred_date == date,
+        JobAssignment.status.in_(["assigned", "claimed", "in_progress", "completed"])
+    ).all()
+    
+    results = []
+    for a in assignments:
+        time_str = a.booking.preferred_time
+        if not time_str: continue
+        
+        separators = ["-", "–", "—"]
+        for sep in separators:
+            if sep in time_str:
+                parts = time_str.split(sep)
+                results.append((parse_time_to_minutes(parts[0]), parse_time_to_minutes(parts[1])))
+                break
+        else:
+            # Single point fallback
+            m = parse_time_to_minutes(time_str)
+            results.append((m, m + 120)) # Assume 2h if unknown
+    return results
+
 
 # ─── Public Availability API ──────────────────────────────
 
@@ -376,36 +431,44 @@ def get_public_slots(
 ):
     """
     Groups available 2-hour windows from ALL active workers matching the service category.
+    Includes granular 'is booked' and 'adjacency' filtering.
     """
     from collections import defaultdict
-    query = db.query(WorkerSlot).join(Worker).filter(
-        WorkerSlot.is_booked == False,
-        Worker.is_active == True
-    )
     
-    # Simple skill matching
+    # 1. Get relevant workers
+    worker_query = db.query(Worker).filter(Worker.is_active == True)
     if service:
         required = extract_required_skills(service)
         for skill in required:
-            query = query.filter(Worker.specializations.contains(skill))
-
-    slots = query.all()
+            worker_query = worker_query.filter(Worker.specializations.contains(skill))
     
-    # Aggregate and segment: result[date] = [ {time: "...", id: "..."} ]
+    workers = worker_query.all()
     result = defaultdict(list)
-    seen_windows = set() # (date, window) to deduplicate multi-worker overlaps
+    seen_windows = set()
 
-    for s in slots:
-        for window in segment_to_2h(s.start_time, s.end_time):
-            key = (s.slot_date, window)
-            if key not in seen_windows:
-                result[s.slot_date].append({"id": s.id, "time": window})
-                seen_windows.add(key)
+    for w in workers:
+        # 2. Get all worker slots for future (simplified to all for now)
+        slots = db.query(WorkerSlot).filter(WorkerSlot.worker_id == w.id).all()
+        
+        # Cache occupied windows for this worker by date to avoid N+1 inside the date loop
+        # We'll just do it simply per date instead.
+        
+        processed_dates = set(s.slot_date for s in slots)
+        occupied_by_date = {d: get_occupied_minutes_for_worker(db, w.id, d) for d in processed_dates}
+
+        for s in slots:
+            occupied = occupied_by_date.get(s.slot_date, [])
+            for window in segment_to_2h(s.start_time, s.end_time):
+                # 3. Apply Granular Filtering (Overlap + Adjacency)
+                if not is_window_conflict(window, occupied):
+                    key = (s.slot_date, window)
+                    if key not in seen_windows:
+                        result[s.slot_date].append({"id": s.id, "time": window})
+                        seen_windows.add(key)
         
     # Sort dates and windows for clean UI
     sorted_result = {}
     for date in sorted(result.keys()):
-        # Sort by parsing the start time of the window (e.g. "09:00 AM")
         sorted_result[date] = sorted(result[date], key=lambda x: parse_time_to_minutes(x["time"].split(" – ")[0]))
         
     return sorted_result
@@ -416,6 +479,65 @@ def get_public_slots(
 def generate_customer_id(db: Session):
     count = db.query(User).count()
     return f"CR-{1001 + count}"
+
+
+# ─── Allocation Logic ──────────────────────────────────────
+
+def perform_auto_allocation(db: Session, booking: ScheduleBooking, preferred_slot_id: str = None, exclude_worker_ids: List[str] = []):
+    """
+    Mandatory Auto-Allocation Engine:
+    1. Filter by Skills
+    2. Filter by Shift Availability (Worker MUST have the slot)
+    3. Selection Tiers:
+       - Tier 1: No time conflicts
+       - Tier 2: Overbooked (Least-Total-Jobs technician wins)
+    """
+    required_skills = extract_required_skills(booking.service)
+    
+    # 1. Get all active workers
+    all_workers = db.query(Worker).filter(Worker.is_active == True, Worker.is_available == True).all()
+    if exclude_worker_ids:
+        all_workers = [w for w in all_workers if w.id not in exclude_worker_ids]
+        
+    tier1 = [] # No conflicts
+    tier2 = [] # Existing conflicts but has the shift
+    
+    for w in all_workers:
+        # A. Skill check
+        worker_skills = [s.strip().lower() for s in (w.specializations or "general").split(",")]
+        if not set(required_skills).issubset(set(worker_skills)):
+            continue
+            
+        # B. Shift check (Must have the slot for that day/time)
+        slots = db.query(WorkerSlot).filter(WorkerSlot.worker_id == w.id, WorkerSlot.slot_date == booking.preferred_date).all()
+        matched_slot = None
+        for s in slots:
+            if does_worker_match_time(booking.preferred_time, [s]):
+                matched_slot = s
+                break
+        
+        if not matched_slot:
+            continue
+
+        # C. Calculate Historical Workload (Total assignments in history)
+        workload = db.query(JobAssignment).filter(JobAssignment.worker_id == w.id).count()
+        
+        # D. Conflict check
+        occupied = get_occupied_minutes_for_worker(db, w.id, booking.preferred_date)
+        if not is_window_conflict(booking.preferred_time, occupied):
+            tier1.append({"worker": w, "workload": workload, "slot": matched_slot})
+        else:
+            tier2.append({"worker": w, "workload": workload, "slot": matched_slot})
+
+    # Selection Logic: Prioritize tier 1, fallback to tier 2
+    candidates = tier1 if tier1 else tier2
+    if not candidates:
+        return None, None
+
+    # Sort by historical workload (Least total jobs wins)
+    candidates.sort(key=lambda x: x["workload"])
+    best = candidates[0]
+    return best["worker"], best["slot"]
 
 
 # ─── Schedule Booking API ─────────────────────────────────
@@ -458,29 +580,55 @@ async def create_booking(
     db.add(booking)
     db.flush()
 
-    # Auto-create a pending JobAssignment so it's tracked from the start
+    # Create initial JobAssignment
     assignment = JobAssignment(
         booking=booking,
         status="pending",
     )
-    
-    # We no longer reserve specific slots or auto-assign workers. 
-    # The booking simply goes to the 'Open Market' as a pending job.
-
     db.add(assignment)
-    db.commit()
-    db.refresh(booking)
-    db.refresh(assignment)
+    db.flush()
 
-    alert = {
+    # Perform Strict Auto-Allocation
+    worker, slot = perform_auto_allocation(db, booking, payload.slot_id)
+    
+    if worker:
+        # Success: Assign job and auto-claim
+        assignment.worker_id = worker.id
+        assignment.status = "claimed" # SKIP assigned, go straight to claimed
+        assignment.assigned_at = datetime.utcnow()
+        assignment.accepted_at = datetime.utcnow()
+        booking.status = "confirmed"
+        
+        if slot:
+            slot.booking_id = booking.id
+            
+        db.commit()
+        db.refresh(booking)
+        db.refresh(assignment)
+
+        # Real-time alert to chosen worker
+        alert = {
+            "type": "new_assignment",
+            "assignment": assignment.to_dict(),
+            "target_worker_id": worker.id,
+            "title": "New Job Assigned",
+            "msg": f"You've been assigned a {booking.service} job for {booking.preferred_date}."
+        }
+        await manager.broadcast_to_workers(alert)
+    else:
+        # ABSOLUTELY NO ONE has the shift: Remains pending for Admin review
+        booking.status = "pending"
+        db.commit()
+        db.refresh(booking)
+
+    # General broadcast to Admins only
+    admin_alert = {
         "type": "new_lead",
         "booking": booking.to_dict(),
         "assignment_id": assignment.id,
+        "auto_assigned": True if worker else False
     }
-
-    # Real-time broadcast to relevant workers & all admins
-    await manager.broadcast_to_specialists(payload.service, alert)
-    await manager.broadcast_to_admins(alert)
+    await manager.broadcast_to_admins(admin_alert)
 
     return {
         "success": True,
@@ -671,16 +819,18 @@ def delete_worker_slot(
     if not slot:
         raise HTTPException(status_code=404, detail="Slot not found")
     
-    if slot.is_booked:
-        raise HTTPException(status_code=400, detail="Cannot delete a booked slot")
+    # Check if any active assignments overlap with this slot's time range
+    s_min = parse_time_to_minutes(slot.start_time)
+    e_min = parse_time_to_minutes(slot.end_time)
     
-    # If this slot was tentatively linked to a booking (e.g. from older logic)
-    # we explicitly unlink it to prevent ghosting.
-    if slot.booking:
-        slot.booking.status = "pending"
-        slot.is_booked = False
-        slot.booking_id = None
-        db.flush()
+    occupied = get_occupied_minutes_for_worker(db, current.id, slot.slot_date)
+    for os, oe in occupied:
+        # Standard overlap check
+        if s_min < oe and e_min > os:
+            raise HTTPException(
+                status_code=400, 
+                detail="Cannot delete slot: You have an assigned job during this time window."
+            )
 
     db.delete(slot)
     db.commit()
@@ -806,47 +956,6 @@ def redact_assignment(a_dict: dict, reveal_all: bool = False):
     return res
 
 
-@app.get("/api/workers/pending-jobs")
-def pending_jobs(current: Worker = Depends(get_current_worker), db: Session = Depends(get_db)):
-    """Unassigned pending jobs filtered to match this worker's specialization. Redacted for privacy."""
-    assignments = (
-        db.query(JobAssignment)
-        .filter(JobAssignment.status == "pending")
-        .order_by(JobAssignment.created_at.desc())
-        .all()
-    )
-    worker_skills = current.to_dict().get("specializations", ["general"])
-    
-    # Pre-fetch all slots for this worker to speed up filtering
-    worker_slots_all = db.query(WorkerSlot).filter(WorkerSlot.worker_id == current.id).all()
-    
-    # Group slots by date for efficient lookup
-    from collections import defaultdict
-    slots_by_date = defaultdict(list)
-    for s in worker_slots_all:
-        slots_by_date[s.slot_date].append(s)
-
-    filtered = []
-    for a in assignments:
-        if not a.booking: continue
-        
-        # 1. Skill Check
-        required = extract_required_skills(a.booking.service)
-        if not set(required).issubset(set(worker_skills)):
-            continue
-            
-        # 2. Availability Check
-        job_date = a.booking.preferred_date
-        job_time = a.booking.preferred_time
-        day_slots = slots_by_date.get(job_date, [])
-        
-        if does_worker_match_time(job_time, day_slots):
-            filtered.append(a)
-
-    raw_list = filtered
-        
-    # Apply server-side redaction for unclaimed leads
-    return [redact_assignment(a.to_dict()) for a in raw_list]
 
 
 
@@ -862,10 +971,10 @@ async def update_job_status(
         raise HTTPException(status_code=404, detail="Assignment not found")
 
     allowed_transitions = {
-        "pending": ["claimed"],
+        "pending": ["claimed"], 
         "assigned": ["claimed", "rejected"],
-        "claimed": ["in_progress", "rejected"],
-        "in_progress": ["completed"],
+        "claimed": ["in_progress", "rejected", "not_completed"],
+        "in_progress": ["completed", "not_completed"],
     }
 
     current_status = assignment.status
@@ -900,15 +1009,83 @@ async def update_job_status(
     now = datetime.utcnow()
     assignment.status = new_status
 
-    if new_status == "claimed":
-        assignment.accepted_at = now
+    if new_status == "rejected":
+        # Check if the job has already started (Time Window restriction)
         booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
         if booking:
-            booking.status = "confirmed"
-    elif new_status == "rejected":
+            try:
+                if not booking.preferred_time:
+                    raise ValueError("No time specified")
+                
+                separators = [re.escape(s) for s in ["-", "–", "—"]]
+                split_pattern = r"\s*(?:" + "|".join(separators) + r")\s*"
+                start_time_part = re.split(split_pattern, booking.preferred_time)[0].strip()
+                
+                dt_str = f"{booking.preferred_date} {start_time_part}"
+                # Use local system time for comparison with local booking time
+                # preferred_date/time are assumed to be in the server/app local time for technician coordination
+                start_dt = datetime.strptime(dt_str, "%Y-%m-%d %I:%M %p")
+                
+                # 24h Restriction: Must cancel at least 24 hours before start
+                if datetime.now() >= (start_dt - timedelta(hours=24)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="It's too late to cancel this job. Cancellation is only allowed more than 24 hours before the scheduled start time."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                print(f"Time validation failed: {e}")
+                # If parsing fails, we allow rejection (safety fallback)
+                pass
+
+        # 1. Identify previous assignees for this booking
+        previous_assignments = db.query(JobAssignment).filter(
+            JobAssignment.booking_id == assignment.booking_id,
+        ).all()
+        exclude_ids = [pa.worker_id for pa in previous_assignments if pa.worker_id]
+        
+        # 2. Reset current assignment
         assignment.worker_id = None
-        assignment.status = "pending"
+        # assignment.status was already set to 'rejected' above
         assignment.assigned_at = None
+        
+        # 3. Attempt re-allocation
+        booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
+        if booking:
+            new_worker, new_slot = perform_auto_allocation(db, booking, exclude_worker_ids=exclude_ids)
+            if new_worker:
+                # Create a NEW assignment for the new worker
+                import uuid
+                new_assignment = JobAssignment(
+                    id=f"AS-{str(uuid.uuid4())[:8].upper()}",
+                    booking_id=booking.id,
+                    worker_id=new_worker.id,
+                    status="claimed", # SKIP assigned, go straight to claimed
+                    assigned_at=datetime.utcnow(),
+                    accepted_at=datetime.utcnow(),
+                )
+                db.add(new_assignment)
+                if new_slot:
+                    new_slot.booking_id = booking.id
+                
+                booking.status = "confirmed"
+                
+                db.commit()
+                db.refresh(new_assignment)
+
+                # Notify the NEW worker
+                await manager.broadcast_to_workers({
+                    "type": "new_assignment",
+                    "assignment": new_assignment.to_dict(),
+                    "target_worker_id": new_worker.id,
+                    "title": "New Job Assigned",
+                    "msg": f"You've been assigned a {booking.service} job for {booking.preferred_date}."
+                })
+            else:
+                # ABSOLUTELY NO ONE else has the shift
+                booking.status = "pending"
+                db.commit()
     elif new_status == "in_progress":
         assignment.started_at = now
         booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
@@ -1087,18 +1264,22 @@ async def admin_assign_job(
         assignment.worker_id = payload.worker_id
         assignment.assigned_by = current.id
         assignment.assigned_at = now
-        assignment.status = "assigned"
+        assignment.accepted_at = now
+        assignment.status = "claimed"
     else:
+        import uuid
         assignment = JobAssignment(
+            id=f"AS-{str(uuid.uuid4())[:8].upper()}",
             booking_id=payload.booking_id,
             worker_id=payload.worker_id,
             assigned_by=current.id,
             assigned_at=now,
-            status="assigned",
+            accepted_at=now,
+            status="claimed",
         )
         db.add(assignment)
 
-    booking.status = "assigned"
+    booking.status = "confirmed"
     db.commit()
     db.refresh(assignment)
 
@@ -1183,7 +1364,7 @@ def get_dashboard_data(
         db.query(ScheduleBooking)
         .options(
             joinedload(ScheduleBooking.user),
-            joinedload(ScheduleBooking.assignment).joinedload(JobAssignment.worker)
+            joinedload(ScheduleBooking.assignments).joinedload(JobAssignment.worker)
         )
         .order_by(ScheduleBooking.created_at.desc())
         .limit(100)
@@ -1193,7 +1374,8 @@ def get_dashboard_data(
     bookings = []
     for b in bookings_raw:
         d = b.to_dict()
-        d["assignment"] = b.assignment.to_dict() if b.assignment else None
+        # Get the latest assignment if available
+        d["assignment"] = b.assignments[-1].to_dict() if b.assignments else None
         # Redact for employees
         if not is_admin_manager:
             d = redact_assignment(d)
