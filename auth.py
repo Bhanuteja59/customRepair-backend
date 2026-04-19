@@ -134,13 +134,3 @@ def require_roles(*roles: str):
             )
         return current_admin
     return _check
-
-
-# ─── WebSocket token helper ───────────────────────────────
-
-def verify_ws_token(token: str, expected_type: str) -> dict:
-    """Validate a token passed as a query param on WS connections."""
-    payload = decode_token(token)
-    if payload.get("type") != expected_type:
-        raise HTTPException(status_code=403, detail=f"Expected {expected_type} token")
-    return payload

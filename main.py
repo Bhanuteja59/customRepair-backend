@@ -1,20 +1,12 @@
-"""
-Custom Repair — FastAPI Backend
-Handles: Schedule Bookings, AI Chat, Auth (Worker + Admin RBAC), Real-time WebSocket
-"""
-
 import os
-import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime
-import asyncio
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 import openai
@@ -26,8 +18,14 @@ from database import (
 )
 from auth import (
     hash_password, verify_password, create_token,
-    get_current_worker, get_current_admin, get_current_customer, 
-    get_optional_customer, require_roles, verify_ws_token, bearer_scheme,
+    get_current_worker, get_current_admin, get_current_customer,
+    get_optional_customer, require_roles,
+)
+from schemas import *
+from utils import (
+    segment_to_2h, generate_customer_id, extract_required_skills,
+    parse_time_to_minutes, does_worker_match_time, redact_assignment,
+    SYSTEM_PROMPT, get_fallback_reply
 )
 
 # App setup ───
@@ -38,7 +36,7 @@ app = FastAPI(
     version="2.0.0",
 )
 
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()] + [
     "http://localhost:3000",
     "http://localhost:3001",
@@ -61,332 +59,50 @@ app.add_middleware(
 )
 
 from fastapi.responses import JSONResponse
-import traceback
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     print(f"GLOBAL ERROR: {exc}")
-    # Dynamically pick the origin from the request to avoid CORS blocking the error message
-    origin = request.headers.get("origin", "http://localhost:3000")
-    
     return JSONResponse(
         status_code=500,
         content={"success": False, "error": str(exc), "type": type(exc).__name__},
-        headers={
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*"
-        }
     )
-
-@app.on_event("startup")
-async def startup_event():
-    # Attempt to initialize database tables on startup
-    try:
-        create_tables()
-    except Exception as e:
-        print(f"STARTUP ERROR (DB): {e}")
 
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 
-# ─── Real-time WebSocket connection manager ───────────────
-
-class ConnectionManager:
-    """Manages active WebSocket connections for workers and admins."""
-
-    def __init__(self):
-        # worker_id → {"ws": WebSocket, "spec": str}
-        self.workers: dict[str, dict] = {}
-        # list of connected admin sockets
-        self.admins: list[WebSocket] = []
-        # user_id → list of WebSockets (one user may have multiple tabs)
-        self.customers: dict[str, list[WebSocket]] = {}
-
-    async def connect_worker(self, worker_id: str, ws: WebSocket, skills: List[str]):
-        await ws.accept()
-        self.workers[worker_id] = {"ws": ws, "skills": [s.lower() for s in skills]}
-
-    def disconnect_worker(self, worker_id: str):
-        self.workers.pop(worker_id, None)
-
-    async def connect_admin(self, ws: WebSocket):
-        await ws.accept()
-        self.admins.append(ws)
-
-    def disconnect_admin(self, ws: WebSocket):
-        if ws in self.admins:
-            self.admins.remove(ws)
-
-
-
-    async def broadcast_to_workers(self, message: dict):
-        """Broadcast to all connected workers."""
-        dead = []
-        for wid, data in list(self.workers.items()):
-            try:
-                await data["ws"].send_text(json.dumps(message))
-            except Exception:
-                dead.append(wid)
-        for wid in dead:
-            self.workers.pop(wid, None)
-
-    async def broadcast_to_specialists(self, service: str, message: dict):
-        """Broadcast to workers who have ALL required skills for the service (AND logic)."""
-        target_skills = extract_required_skills(service)
-        dead = []
-        for wid, data in list(self.workers.items()):
-            worker_skills = data.get("skills", ["general"])
-            # SUPERSET CHECK: Worker must cover all requirements
-            if set(target_skills).issubset(set(worker_skills)):
-                try:
-                    await data["ws"].send_text(json.dumps(message))
-                except Exception:
-                    dead.append(wid)
-        for wid in dead:
-            self.workers.pop(wid, None)
-
-    async def send_to_worker(self, worker_id: str, message: dict):
-        """Send to a specific worker if connected."""
-        data = self.workers.get(worker_id)
-        if data:
-            try:
-                await data["ws"].send_text(json.dumps(message))
-            except Exception:
-                self.workers.pop(worker_id, None)
-
-    async def broadcast_to_admins(self, message: dict):
-        """Broadcast to all connected admins."""
-        dead = []
-        for ws in list(self.admins):
-            try:
-                await ws.send_text(json.dumps(message))
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.admins.remove(ws)
-
-    async def connect_customer(self, user_id: str, ws: WebSocket):
-        await ws.accept()
-        if user_id not in self.customers:
-            self.customers[user_id] = []
-        self.customers[user_id].append(ws)
-
-    def disconnect_customer(self, user_id: str, ws: WebSocket):
-        if user_id in self.customers:
-            self.customers[user_id] = [s for s in self.customers[user_id] if s is not ws]
-            if not self.customers[user_id]:
-                del self.customers[user_id]
-
-    async def send_to_customer(self, user_id: str, message: dict):
-        """Send a real-time update to all active sessions of a specific customer."""
-        sockets = self.customers.get(user_id, [])
-        dead = []
-        for ws in list(sockets):
-            try:
-                await ws.send_text(json.dumps(message))
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            if user_id in self.customers and ws in self.customers[user_id]:
-                self.customers[user_id].remove(ws)
-        if user_id in self.customers and not self.customers[user_id]:
-            del self.customers[user_id]
-
-
-manager = ConnectionManager()
-async def check_job_expiry():
-    """Background loop to mark missed slots as expired. (Only runs if not on Vercel)"""
-    if os.getenv("VERCEL"):
-        print("Vercel environment detected. Background loop disabled. Use /api/cron/check-expiry instead.")
-        return
-
-    while True:
-        try:
-            # Run check every 1 minute
-            await asyncio.sleep(60)
-            await run_expiry_check()
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"Background Task Error: {e}")
-            await asyncio.sleep(5) # Cooldown before retry
-
-async def run_expiry_check():
-    """Internal function to run the actual expiry logic."""
-    print("Checking for expired job windows...")
-    
-    # Using SessionLocal directly with a try/finally to ensure closure
+def run_expiry_check():
+    """Mark assigned/claimed jobs as expired if their time window has passed."""
     db = SessionLocal()
     try:
-        now = datetime.now() 
-        
-        # We only expire jobs that are assigned/claimed but not yet started
+        now = datetime.now()
         expired_candidates = (
             db.query(JobAssignment)
             .filter(JobAssignment.status.in_(["assigned", "claimed"]))
             .all()
         )
-        
         for a in expired_candidates:
-            if not a.booking: continue
-            
+            if not a.booking:
+                continue
             try:
                 date_str = a.booking.preferred_date
                 time_str = a.booking.preferred_time
-                
-                if not date_str: continue
-                
-                # Handle flexible slots - expire at end of day
+                if not date_str:
+                    continue
                 if not time_str or any(x in time_str.lower() for x in ["flex", "asap"]):
                     end_dt = datetime.strptime(f"{date_str} 11:59 PM", "%Y-%m-%d %I:%M %p")
                 else:
-                    # "10:00 AM - 12:00 PM" -> "12:00 PM"
                     end_part = time_str.split("-")[-1].strip()
                     end_dt = datetime.strptime(f"{date_str} {end_part}", "%Y-%m-%d %I:%M %p")
-                
                 if now > end_dt:
-                    print(f"Job {a.id} expired! Window ended at {end_dt}")
                     a.status = "expired"
                     a.booking.status = "overdue"
                     db.commit()
-                    
-                    # Real-time alert to admins
-                    await manager.broadcast_to_admins({
-                        "type": "job_status_update",
-                        "assignment": a.to_dict(),
-                        "message": f"Window missed for {a.booking.service}. Ticket marked as expired."
-                    })
-            except Exception as parse_err:
-                # Log but don't crash
+            except Exception:
                 pass
-    except Exception as db_err:
-        print(f"Database Error in expiry check: {db_err}")
+    except Exception as e:
+        print(f"Database error in expiry check: {e}")
     finally:
         db.close()
-
-@app.get("/api/cron/check-expiry")
-async def cron_check_expiry(auth: Optional[str] = Query(None)):
-    """Vercel Cron endpoint to trigger expiry check."""
-    # Optional: check for a secret key to prevent unauthorized triggers
-    # CRON_SECRET = os.getenv("CRON_SECRET")
-    # if CRON_SECRET and auth != CRON_SECRET:
-    #     raise HTTPException(status_code=401, detail="Unauthorized")
-    
-    await run_expiry_check()
-    return {"status": "success", "message": "Expiry check completed"}
-
-
-# ─── Startup ──────────────────────────────────────────────
-
-@app.on_event("startup")
-def on_startup():
-    try:
-        create_tables()
-        # Launch the expiry check in the background
-        asyncio.create_task(check_job_expiry())
-    except Exception as e:
-        print(f"DATABASE ERROR: {e}")
-
-# ─── Health ───────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "Custom Repair API", "version": "2.0.0"}
-
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "connected_workers": len(manager.workers),
-        "connected_admins": len(manager.admins),
-    }
-
-# ─── Pydantic schemas ─────────────────────────────────────
-
-class ScheduleRequest(BaseModel):
-    service: str
-    name: str
-    phone: str
-    email: str
-    address: Optional[str] = None
-    date: Optional[str] = None
-    time: Optional[str] = None
-    notes: Optional[str] = None
-    slot_id: Optional[str] = None
-
-class ChatSessionCreate(BaseModel):
-    category: str
-    category_label: Optional[str] = None
-
-class ChatMessageRequest(BaseModel):
-    session_id: str
-    message: str
-    category: Optional[str] = None
-
-class WorkerSignupRequest(BaseModel):
-    name: str
-    email: EmailStr
-    phone: Optional[str] = None
-    password: str
-    specializations: List[str] = ["general"]
-
-class CustomerSignupRequest(BaseModel):
-    name: str
-    email: EmailStr
-    phone: str
-    password: str
-    address: Optional[str] = None
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-class AdminUserCreate(BaseModel):
-    name: str
-    email: EmailStr
-    password: str
-    role: str = "employee"  # admin | manager | employee
-    department: Optional[str] = None
-
-class AssignJobRequest(BaseModel):
-    booking_id: str
-    worker_id: str
-
-class JobStatusUpdate(BaseModel):
-    status: str   # claimed | rejected | in_progress | completed
-    notes: Optional[str] = None
-
-class WorkerAvailabilityUpdate(BaseModel):
-    is_available: bool
-
-class WorkerProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None
-    specializations: Optional[List[str]] = None
-
-class WorkerSlotCreate(BaseModel):
-    slot_date: str
-    start_time: str
-    end_time: str
-
-def segment_to_2h(start_str: str, end_str: str):
-    """Yields 2-hour time window strings between start and end."""
-    from datetime import datetime, timedelta
-    fmt = "%I:%M %p"
-    try:
-        t_start = datetime.strptime(start_str.strip(), fmt)
-        t_end = datetime.strptime(end_str.strip(), fmt)
-        
-        current = t_start
-        while current + timedelta(hours=2) <= t_end:
-            nxt = current + timedelta(hours=2)
-            yield f"{current.strftime(fmt)} – {nxt.strftime(fmt)}"
-            current = nxt
-    except Exception:
-        # Fallback if parsing fails
-        yield f"{start_str} – {end_str}"
 
 
 # ─── Public Availability API ──────────────────────────────
@@ -433,17 +149,12 @@ def get_public_slots(
     return sorted_result
 
 
-# ─── Customer Helpers ──────────────────────────────────────
-
-def generate_customer_id(db: Session):
-    count = db.query(User).count()
-    return f"CR-{1001 + count}"
 
 
 # ─── Schedule Booking API ─────────────────────────────────
 
 @app.post("/api/schedule")
-async def create_booking(
+def create_booking(
     payload: ScheduleRequest, 
     db: Session = Depends(get_db),
     current: Optional[User] = Depends(get_optional_customer)
@@ -493,16 +204,6 @@ async def create_booking(
     db.commit()
     db.refresh(booking)
     db.refresh(assignment)
-
-    alert = {
-        "type": "new_lead",
-        "booking": booking.to_dict(),
-        "assignment_id": assignment.id,
-    }
-
-    # Real-time broadcast to relevant workers & all admins
-    await manager.broadcast_to_specialists(payload.service, alert)
-    await manager.broadcast_to_admins(alert)
 
     return {
         "success": True,
@@ -721,111 +422,7 @@ def worker_jobs(current: Worker = Depends(get_current_worker), db: Session = Dep
     return [redact_assignment(a.to_dict()) for a in assignments]
 
 
-def extract_required_skills(service: str) -> List[str]:
-    """Identify ALL required skills for a booking based on keywords (Multi-trade support)."""
-    s = (service or "").lower()
-    required = []
-    if "plumb" in s:
-        required.append("plumbing")
-    if any(x in s for x in ["hvac", "ac ", "furnace", "heat", "thermostat"]):
-        required.append("hvac")
-    if "electr" in s:
-        required.append("electrical")
-    
-    # If no specialty detected, default to general
-    if not required:
-        required.append("general")
-    return required
 
-
-def parse_time_to_minutes(time_str: str) -> int:
-    """Converts '09:00 AM' to minutes from midnight."""
-    try:
-        t = datetime.strptime(time_str.strip(), "%I:%M %p")
-        return t.hour * 60 + t.minute
-    except:
-        return 0
-
-
-def does_worker_match_time(booking_time: str, worker_slots: List[WorkerSlot]) -> bool:
-    """Checks if ANY worker slot overlaps with the requested booking time."""
-    if not booking_time or any(x in booking_time.lower() for x in ["flex", "asap"]):
-        return len(worker_slots) > 0
-
-    # Common separators including en-dash and em-dash
-    separators = ["-", "–", "—"]
-    booking_start, booking_end = 0, 0
-    
-    found_sep = False
-    for sep in separators:
-        if sep in booking_time:
-            parts = booking_time.split(sep)
-            if len(parts) == 2:
-                booking_start = parse_time_to_minutes(parts[0])
-                booking_end = parse_time_to_minutes(parts[1])
-                found_sep = True
-                break
-    
-    if not found_sep:
-        # If no range, treat as a single point in time
-        booking_start = parse_time_to_minutes(booking_time)
-        booking_end = booking_start + 60 # Default 1h duration
-
-    for slot in worker_slots:
-        slot_start = parse_time_to_minutes(slot.start_time)
-        slot_end = parse_time_to_minutes(slot.end_time)
-        
-        # Check for ANY overlap
-        # (StartA < EndB) and (EndA > StartB)
-        if (booking_start < slot_end) and (booking_end > slot_start):
-            return True
-            
-    return False
-
-
-def redact_assignment(a_dict: dict, reveal_all: bool = False):
-    """
-    Advanced security utility to mask PII (Personally Identifiable Information).
-    Ensures data minimization by scrubbing names, phones, and addresses 
-    based on the 'Least Privilege' principle.
-    """
-    if reveal_all:
-        return a_dict
-        
-    import copy
-    res = copy.deepcopy(a_dict)
-    
-    # Check if this assignment is unclaimed (pending) or completed
-    status = res.get("status")
-    
-    # Reveal all details for active jobs so the worker can perform the service
-    is_active_work = status in ["assigned", "claimed", "in_progress"]
-
-    if "booking" in res and res["booking"]:
-        booking = res["booking"]
-        # Hide customer notes for unclaimed leads
-        if status == "pending":
-            booking["notes"] = "[Secure Content]: Claim job to view customer directives"
-            
-        if "user" in booking and booking["user"]:
-            u = booking["user"]
-            
-            # If not active work, mask identity and location
-            if not is_active_work:
-                u["phone"] = "PII PROTECTED"
-                u["name"] = f"Client {booking.get('id', '??')[:4]}"
-                
-                # Address redaction
-                full_addr = u.get("address", "")
-                if status == "pending":
-                    # Show city/zip for locality context
-                    parts = full_addr.split(",")
-                    u["address"] = parts[-1].strip() if len(parts) > 1 else "Area Masked"
-                else:
-                    u["address"] = "Confidential - Ticket Closed"
-            # Else (assigned, claimed, in_progress): The technician sees everything!
-                
-    return res
 
 
 @app.get("/api/workers/pending-jobs")
@@ -873,7 +470,7 @@ def pending_jobs(current: Worker = Depends(get_current_worker), db: Session = De
 
 
 @app.patch("/api/jobs/{assignment_id}/status")
-async def update_job_status(
+def update_job_status(
     assignment_id: str,
     payload: JobStatusUpdate,
     current: Worker = Depends(get_current_worker),
@@ -887,7 +484,7 @@ async def update_job_status(
         "pending": ["claimed"],
         "assigned": ["claimed", "rejected"],
         "claimed": ["in_progress", "rejected"],
-        "in_progress": ["completed"],
+        "in_progress": ["completed", "not_completed"],
     }
 
     current_status = assignment.status
@@ -941,26 +538,16 @@ async def update_job_status(
         booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
         if booking:
             booking.status = "completed"
+    elif new_status == "not_completed":
+        booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
+        if booking:
+            booking.status = "overdue"
 
     if payload.notes:
         assignment.worker_notes = payload.notes
 
     db.commit()
     db.refresh(assignment)
-
-    # Broadcast status change to all admins
-    await manager.broadcast_to_admins({
-        "type": "job_status_update",
-        "assignment": assignment.to_dict(),
-    })
-
-    # Notify the customer if they are online
-    if assignment.booking and assignment.booking.user_id:
-        await manager.send_to_customer(assignment.booking.user_id, {
-            "type": "job_update",
-            "assignment": assignment.to_dict(),
-            "message": f"Your {assignment.booking.service} job status changed to {new_status}."
-        })
 
     return assignment.to_dict()
 
@@ -1076,7 +663,7 @@ def admin_get_bookings(
 
 
 @app.post("/api/admin/assign")
-async def admin_assign_job(
+def admin_assign_job(
     payload: AssignJobRequest,
     current: AdminUser = Depends(require_roles("admin", "manager")),
     db: Session = Depends(get_db),
@@ -1123,20 +710,6 @@ async def admin_assign_job(
     booking.status = "assigned"
     db.commit()
     db.refresh(assignment)
-
-    # Alerts & Notifications
-    alert = {
-        "type": "new_assignment",
-        "assignment": assignment.to_dict(),
-    }
-    await manager.send_to_worker(payload.worker_id, alert)
-    await manager.broadcast_to_admins({"type": "job_assigned", "assignment": assignment.to_dict()})
-    if booking.user_id:
-        await manager.send_to_customer(booking.user_id, {
-            "type": "job_update",
-            "assignment": assignment.to_dict(),
-            "message": f"A technician has been assigned to your {booking.service} request.",
-        })
 
     return assignment.to_dict()
 
@@ -1432,138 +1005,9 @@ def get_problem_analytics(db: Session = Depends(get_db)):
     return [{"category": r.category, "count": r.count} for r in results]
 
 
-# ─── WebSocket: Workers ───────────────────────────────────
-
-@app.websocket("/ws/worker/{worker_id}")
-async def ws_worker(
-    websocket: WebSocket,
-    worker_id: str,
-    token: Optional[str] = Query(default=None),
-):
-    """Real-time channel for a worker. Pass token as ?token=<jwt>"""
-    if not token:
-        await websocket.close(code=1008, reason="Missing token")
-        return
-    try:
-        payload = verify_ws_token(token, "worker")
-        if payload.get("sub") != worker_id:
-            await websocket.close(code=1008, reason="Token mismatch")
-            return
-    except Exception:
-        await websocket.close(code=1008, reason="Invalid token")
-        return
-
-    # Use a manual session generator for WebSocket safety
-    db = next(get_db())
-    try:
-        # Fetch specializations for targeted alerts (ensuring we strip spaces)
-        worker = db.query(Worker).filter(Worker.id == worker_id).first()
-        skills = [s.strip() for s in (worker.specializations or "general").split(",")] if worker else ["general"]
-
-        await manager.connect_worker(worker_id, websocket, skills)
-        while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        manager.disconnect_worker(worker_id)
-    finally:
-        db.close()
 
 
-# ─── WebSocket: Admins ────────────────────────────────────
 
-@app.websocket("/ws/admin")
-async def ws_admin(
-    websocket: WebSocket,
-    token: Optional[str] = Query(default=None),
-):
-    """Real-time channel for admin users. Pass token as ?token=<jwt>"""
-    if not token:
-        await websocket.close(code=1008, reason="Missing token")
-        return
-    try:
-        verify_ws_token(token, "admin")
-    except Exception:
-        await websocket.close(code=1008, reason="Invalid token")
-        return
-
-    await manager.connect_admin(websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        manager.disconnect_admin(websocket)
+# ─── End of API ───────────────────────────────────────────
 
 
-# ─── AI fallback replies ──────────────────────────────────
-
-SYSTEM_PROMPT = """You are a helpful, friendly AI support assistant for Custom Repair, a Metro Atlanta home services company specializing in HVAC, plumbing, and electrical work.
-
-Your role:
-1. Help users troubleshoot their home repair problems
-2. Ask clarifying questions to understand the issue better
-3. Provide preliminary guidance (but always recommend professional service for safety)
-4. Categorize the severity (urgent/can-wait)
-5. Offer to connect them with a technician or direct them to schedule at /schedule
-
-Company facts:
-- Service 20+ Metro Atlanta cities
-- 24/7 emergency service, 2-hour emergency response
-- Free estimates
-- $50 off first service
-- 0% APR financing on qualifying systems
-- Lifetime workmanship guarantee
-- Phone: (555) 123-4567
-
-Tone: Warm, professional, knowledgeable. Keep replies concise (2-4 sentences usually). Use bullet points for multi-step guidance.
-
-IMPORTANT: Always prioritize safety. For gas leaks, electrical sparks, or flooding — tell them to shut it off immediately and call emergency services if needed.
-"""
-
-
-def get_fallback_reply(text: str, category: str) -> str:
-    t, cat = text.lower(), category.lower()
-    if "ac" in cat or "cooling" in cat:
-        if any(w in t for w in ["not cool", "warm", "hot"]):
-            return "Sounds like a refrigerant or airflow issue. Quick check: Is the outdoor unit running? Is the air filter clean? Our HVAC techs can diagnose same-day. Want to schedule a visit?"
-        return "For AC problems, describe what's happening — not turning on, not cooling, making noise, or leaking water?"
-    if "water" in cat or "plumb" in cat:
-        if "leak" in t:
-            return "⚠️ For an active leak: shut off the water supply valve near the source (or the main shutoff). Then book a plumber — we offer same-day service. Is it from a pipe, fixture, or appliance?"
-        return "Our licensed plumbers handle leaks, clogs, water heaters, low pressure, and more. Can you share more specifics?"
-    if "electric" in cat:
-        return "⚡ Safety first — never work on live electrical systems. Is it a single outlet/fixture, a whole circuit, or a panel issue? Our certified electricians can run a full diagnostic."
-    if any(w in t for w in ["book", "schedule"]):
-        return "You can book a visit at our Schedule page, or I can take your details right here. What date and time works best?"
-    return "Thanks for the details! Based on what you've described, I'd recommend a technician visit. We offer free estimates and same-day service. Would you like to schedule?"
-
-
-@app.websocket("/ws/customer/{user_id}")
-async def ws_customer(
-    websocket: WebSocket,
-    user_id: str,
-    token: Optional[str] = Query(default=None),
-):
-    """Real-time channel for customers. Pass token as ?token=<jwt>"""
-    if not token:
-        await websocket.close(code=1008, reason="Missing token")
-        return
-    try:
-        payload = verify_ws_token(token, "customer")
-        if payload.get("sub") != user_id:
-            await websocket.close(code=1008, reason="Token mismatch")
-            return
-    except Exception:
-        await websocket.close(code=1008, reason="Invalid token")
-        return
-
-    await manager.connect_customer(user_id, websocket)
-    try:
-        while True:
-            # Keep connection alive
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect_customer(user_id, websocket)
