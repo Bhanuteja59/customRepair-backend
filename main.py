@@ -36,8 +36,9 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# Robust CORS Configuration
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()] + [
+_base_origins = [
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:3002",
@@ -49,23 +50,48 @@ ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.st
     "https://custom-repair-admin.vercel.app",
     "https://custom-repair-client.vercel.app",
 ]
+ALLOWED_ORIGINS: list[str] = list(dict.fromkeys(
+    [o.strip() for o in _raw_origins.split(",") if o.strip()] + _base_origins
+))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(dict.fromkeys(ALLOWED_ORIGINS)),
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 from fastapi.responses import JSONResponse
 
+@app.on_event("startup")
+def startup_db():
+    create_tables()
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     print(f"GLOBAL ERROR: {exc}")
+    
+    # Manual CORS header injection for error responses
+    # This ensures that even on 500 errors, the browser receives the necessary CORS headers
+    origin = request.headers.get("origin")
+    headers = {}
+    if origin in ALLOWED_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+    elif "*" in ALLOWED_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = "*"
+    
     return JSONResponse(
         status_code=500,
-        content={"success": False, "error": str(exc), "type": type(exc).__name__},
+        content={
+            "success": False, 
+            "error": str(exc), 
+            "type": type(exc).__name__,
+            "detail": "An internal server error occurred. Please check server logs."
+        },
+        headers=headers
     )
 
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))

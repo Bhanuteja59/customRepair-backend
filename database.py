@@ -36,6 +36,17 @@ def get_db():
         db.close()
 
 
+def safe_json_load(data, default_val):
+    """Safely parse JSON string, returning default if invalid or empty."""
+    if not data:
+        return default_val
+    try:
+        import json
+        return json.loads(data)
+    except Exception:
+        return default_val
+
+
 # ─── Customer Models ────────────────────────────────────────
 
 class User(Base):
@@ -184,9 +195,9 @@ class Worker(Base):
             "specializations": [s.strip() for s in (self.specializations or "general").split(",")],
             "is_active": self.is_active,
             "is_available": self.is_available,
-            "notif_prefs": json.loads(self.notif_prefs) if self.notif_prefs else { "newLead": True, "jobAssigned": True, "scheduleReminder": True, "systemUpdates": False, "marketing": False },
-            "sched_prefs": json.loads(self.sched_prefs) if self.sched_prefs else { "autoAccept": False, "bufferBetweenJobs": True, "weekendsAvailable": True, "maxJobsPerDay": "3" },
-            "privacy_prefs": json.loads(self.privacy_prefs) if self.privacy_prefs else { "showPhone": False, "locationSharing": True, "twoFactor": False },
+            "notif_prefs": safe_json_load(self.notif_prefs, { "newLead": True, "jobAssigned": True, "scheduleReminder": True, "systemUpdates": False, "marketing": False }),
+            "sched_prefs": safe_json_load(self.sched_prefs, { "autoAccept": False, "bufferBetweenJobs": True, "weekendsAvailable": True, "maxJobsPerDay": "3" }),
+            "privacy_prefs": safe_json_load(self.privacy_prefs, { "showPhone": False, "locationSharing": True, "twoFactor": False }),
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
