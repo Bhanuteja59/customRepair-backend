@@ -91,7 +91,11 @@ def run_expiry_check():
                 if not time_str or any(x in time_str.lower() for x in ["flex", "asap"]):
                     end_dt = datetime.strptime(f"{date_str} 11:59 PM", "%Y-%m-%d %I:%M %p")
                 else:
-                    end_part = time_str.split("-")[-1].strip()
+                    end_part = time_str
+                    for sep in [" – ", " — ", "–", "—", " - ", "-"]:
+                        if sep in time_str:
+                            end_part = time_str.split(sep)[-1].strip()
+                            break
                     end_dt = datetime.strptime(f"{date_str} {end_part}", "%Y-%m-%d %I:%M %p")
                 if now > end_dt:
                     a.status = "expired"
@@ -118,7 +122,8 @@ def get_public_slots(
     from collections import defaultdict
     query = db.query(WorkerSlot).join(Worker).filter(
         WorkerSlot.is_booked == False,
-        Worker.is_active == True
+        Worker.is_active == True,
+        Worker.is_available == True
     )
     
     # Simple skill matching
@@ -149,6 +154,110 @@ def get_public_slots(
     return sorted_result
 
 
+
+
+def get_occupied_minutes_for_worker(db: Session, worker_id: str, date_str: str) -> List[tuple]:
+    job_assignments = db.query(JobAssignment).filter(
+        JobAssignment.worker_id == worker_id,
+        JobAssignment.status.in_(["assigned", "claimed", "in_progress"])
+    ).all()
+    
+    occupied = []
+    for a in job_assignments:
+        if a.booking and a.booking.preferred_date == date_str:
+            t_str = a.booking.preferred_time
+            if not t_str or any(x in t_str.lower() for x in ["flex", "asap"]):
+                continue
+            
+            separators = ["-", "–", "—"]
+            found_sep = False
+            for sep in separators:
+                if sep in t_str:
+                    parts = t_str.split(sep)
+                    if len(parts) == 2:
+                        s = parse_time_to_minutes(parts[0])
+                        e = parse_time_to_minutes(parts[1])
+                        occupied.append((s, e))
+                        found_sep = True
+                        break
+            if not found_sep:
+                s = parse_time_to_minutes(t_str)
+                occupied.append((s, s + 60))
+    return occupied
+
+def is_window_conflict(target_time: str, occupied_intervals: List[tuple]) -> bool:
+    if not target_time or any(x in target_time.lower() for x in ["flex", "asap"]):
+        return False
+        
+    separators = ["-", "–", "—"]
+    t_start, t_end = 0, 0
+    found_sep = False
+    for sep in separators:
+        if sep in target_time:
+            parts = target_time.split(sep)
+            if len(parts) == 2:
+                t_start = parse_time_to_minutes(parts[0])
+                t_end = parse_time_to_minutes(parts[1])
+                found_sep = True
+                break
+    if not found_sep:
+        t_start = parse_time_to_minutes(target_time)
+        t_end = t_start + 60
+    
+    for (o_start, o_end) in occupied_intervals:
+        if max(t_start, o_start) < min(t_end, o_end):
+            return True
+            
+    return False
+
+def perform_auto_allocation(db: Session, booking: ScheduleBooking, exclude_worker_ids: List[str] = [], allow_overbooking: bool = False):
+    """
+    Mandatory Auto-Allocation Engine:
+    1. Filter by Skills
+    2. Filter by Shift Availability (Worker MUST have the slot)
+    3. Selection Tiers:
+       - Tier 1: No time conflicts
+       - Tier 2: Overbooked (Least-Total-Jobs technician wins)
+    """
+    required_skills = extract_required_skills(booking.service)
+    
+    all_workers = db.query(Worker).filter(Worker.is_active == True, Worker.is_available == True).all()
+    if exclude_worker_ids:
+        all_workers = [w for w in all_workers if w.id not in exclude_worker_ids]
+        
+    tier1 = [] # No conflicts
+    tier2 = [] # Existing conflicts but has the shift
+    
+    for w in all_workers:
+        worker_skills = [s.strip().lower() for s in (w.specializations or "general").split(",")]
+        if not set(required_skills).issubset(set(worker_skills)):
+            continue
+            
+        slots = db.query(WorkerSlot).filter(WorkerSlot.worker_id == w.id, WorkerSlot.slot_date == booking.preferred_date).all()
+        matched_slot = None
+        for s in slots:
+            if does_worker_match_time(booking.preferred_time, [s]):
+                matched_slot = s
+                break
+        
+        if not matched_slot:
+            continue
+
+        workload = db.query(JobAssignment).filter(JobAssignment.worker_id == w.id).count()
+        occupied = get_occupied_minutes_for_worker(db, w.id, booking.preferred_date)
+        
+        if not is_window_conflict(booking.preferred_time, occupied):
+            tier1.append({"worker": w, "workload": workload, "slot": matched_slot})
+        else:
+            tier2.append({"worker": w, "workload": workload, "slot": matched_slot})
+
+    candidates = tier1 if tier1 else (tier2 if allow_overbooking else [])
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda x: x["workload"])
+    best = candidates[0]
+    return best["worker"], best["slot"]
 
 
 # ─── Schedule Booking API ─────────────────────────────────
@@ -197,8 +306,19 @@ def create_booking(
         status="pending",
     )
     
-    # We no longer reserve specific slots or auto-assign workers. 
-    # The booking simply goes to the 'Open Market' as a pending job.
+    # Perform Strict Auto-Allocation without overbooking for initial requests
+    worker, slot = perform_auto_allocation(db, booking, allow_overbooking=False)
+    
+    if worker:
+        # Success: Assign job and auto-claim
+        assignment.worker_id = worker.id
+        assignment.status = "claimed"
+        assignment.assigned_at = datetime.utcnow()
+        assignment.accepted_at = datetime.utcnow()
+        booking.status = "confirmed"
+    else:
+        # ABSOLUTELY NO ONE has the shift: Remains pending for Admin review
+        booking.status = "pending"
 
     db.add(assignment)
     db.commit()
@@ -347,11 +467,20 @@ def update_worker_profile(
     current: Worker = Depends(get_current_worker),
     db: Session = Depends(get_db),
 ):
+    import json
     worker = db.query(Worker).filter(Worker.id == current.id).first()
     if payload.name: worker.name = payload.name
     if payload.phone: worker.phone = payload.phone
     if payload.specializations is not None:
         worker.specializations = ",".join(payload.specializations)
+    
+    if payload.notif_prefs is not None:
+        worker.notif_prefs = json.dumps(payload.notif_prefs)
+    if payload.sched_prefs is not None:
+        worker.sched_prefs = json.dumps(payload.sched_prefs)
+    if payload.privacy_prefs is not None:
+        worker.privacy_prefs = json.dumps(payload.privacy_prefs)
+        
     db.commit()
     db.refresh(worker)
     return worker.to_dict()
@@ -424,51 +553,6 @@ def worker_jobs(current: Worker = Depends(get_current_worker), db: Session = Dep
 
 
 
-
-@app.get("/api/workers/pending-jobs")
-def pending_jobs(current: Worker = Depends(get_current_worker), db: Session = Depends(get_db)):
-    """Unassigned pending jobs filtered to match this worker's specialization. Redacted for privacy."""
-    assignments = (
-        db.query(JobAssignment)
-        .filter(JobAssignment.status == "pending")
-        .order_by(JobAssignment.created_at.desc())
-        .all()
-    )
-    worker_skills = current.to_dict().get("specializations", ["general"])
-    
-    # Pre-fetch all slots for this worker to speed up filtering
-    worker_slots_all = db.query(WorkerSlot).filter(WorkerSlot.worker_id == current.id).all()
-    
-    # Group slots by date for efficient lookup
-    from collections import defaultdict
-    slots_by_date = defaultdict(list)
-    for s in worker_slots_all:
-        slots_by_date[s.slot_date].append(s)
-
-    filtered = []
-    for a in assignments:
-        if not a.booking: continue
-        
-        # 1. Skill Check
-        required = extract_required_skills(a.booking.service)
-        if not set(required).issubset(set(worker_skills)):
-            continue
-            
-        # 2. Availability Check
-        job_date = a.booking.preferred_date
-        job_time = a.booking.preferred_time
-        day_slots = slots_by_date.get(job_date, [])
-        
-        if does_worker_match_time(job_time, day_slots):
-            filtered.append(a)
-
-    raw_list = filtered
-        
-    # Apply server-side redaction for unclaimed leads
-    return [redact_assignment(a.to_dict()) for a in raw_list]
-
-
-
 @app.patch("/api/jobs/{assignment_id}/status")
 def update_job_status(
     assignment_id: str,
@@ -525,9 +609,19 @@ def update_job_status(
         if booking:
             booking.status = "confirmed"
     elif new_status == "rejected":
-        assignment.worker_id = None
-        assignment.status = "pending"
-        assignment.assigned_at = None
+        # Attempt to auto-allocate to someone else, allowing overbooking as an emergency fallback
+        exclude = [current.id]
+        booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
+        worker, slot = perform_auto_allocation(db, booking, exclude_worker_ids=exclude, allow_overbooking=True)
+        if worker:
+            assignment.worker_id = worker.id
+            assignment.status = "assigned" 
+            assignment.assigned_at = now
+            assignment.accepted_at = None
+        else:
+            assignment.worker_id = None
+            assignment.status = "pending"
+            assignment.assigned_at = None
     elif new_status == "in_progress":
         assignment.started_at = now
         booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
