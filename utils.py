@@ -5,19 +5,22 @@ from sqlalchemy.orm import Session
 from database import User, WorkerSlot
 
 def segment_to_2h(start_str: str, end_str: str):
-    """Yields 2-hour time window strings between start and end."""
+    """
+    Yields every possible 2-hour window that fits within start→end,
+    stepping 1 hour at a time so all overlapping options are surfaced.
+    e.g. 09:00–12:00 → ["09:00 AM – 11:00 AM", "10:00 AM – 12:00 PM"]
+    """
     fmt = "%I:%M %p"
     try:
         t_start = datetime.strptime(start_str.strip(), fmt)
         t_end = datetime.strptime(end_str.strip(), fmt)
-        
+
         current = t_start
         while current + timedelta(hours=2) <= t_end:
             nxt = current + timedelta(hours=2)
             yield f"{current.strftime(fmt)} – {nxt.strftime(fmt)}"
-            current = nxt
+            current += timedelta(hours=1)  # slide 1 hour to expose all 2-hour slots
     except Exception:
-        # Fallback if parsing fails
         yield f"{start_str} – {end_str}"
 
 def generate_customer_id(db: Session):

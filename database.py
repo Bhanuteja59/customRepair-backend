@@ -14,6 +14,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 import uuid
+import json
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/customrepair")
 
@@ -82,7 +83,7 @@ class ScheduleBooking(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="bookings")
-    assignment = relationship("JobAssignment", back_populates="booking", uselist=False)
+    assignments = relationship("JobAssignment", back_populates="booking")
     slot = relationship("WorkerSlot", back_populates="booking", uselist=False)
 
     def to_dict(self):
@@ -163,6 +164,12 @@ class Worker(Base):
     specializations = Column(String(200), default="general")
     is_active = Column(Boolean, default=True)
     is_available = Column(Boolean, default=True)
+    
+    # Preferences stored as JSON strings
+    notif_prefs = Column(Text, nullable=True)
+    sched_prefs = Column(Text, nullable=True)
+    privacy_prefs = Column(Text, nullable=True)
+    
     created_at = Column(DateTime, default=datetime.utcnow)
 
     assignments = relationship("JobAssignment", back_populates="worker")
@@ -177,6 +184,9 @@ class Worker(Base):
             "specializations": [s.strip() for s in (self.specializations or "general").split(",")],
             "is_active": self.is_active,
             "is_available": self.is_available,
+            "notif_prefs": json.loads(self.notif_prefs) if self.notif_prefs else { "newLead": True, "jobAssigned": True, "scheduleReminder": True, "systemUpdates": False, "marketing": False },
+            "sched_prefs": json.loads(self.sched_prefs) if self.sched_prefs else { "autoAccept": False, "bufferBetweenJobs": True, "weekendsAvailable": True, "maxJobsPerDay": "3" },
+            "privacy_prefs": json.loads(self.privacy_prefs) if self.privacy_prefs else { "showPhone": False, "locationSharing": True, "twoFactor": False },
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -220,7 +230,7 @@ class JobAssignment(Base):
     __tablename__ = "job_assignments"
 
     id = Column(String(36), primary_key=True, default=lambda: "JA-" + str(uuid.uuid4())[:8].upper())
-    booking_id = Column(String(36), ForeignKey("schedule_bookings.id"), nullable=False, unique=True)
+    booking_id = Column(String(36), ForeignKey("schedule_bookings.id"), nullable=False)
     worker_id = Column(String(36), ForeignKey("workers.id"), nullable=True)
     assigned_by = Column(String(36), nullable=True)   # AdminUser.id
 
@@ -235,7 +245,7 @@ class JobAssignment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    booking = relationship("ScheduleBooking", back_populates="assignment")
+    booking = relationship("ScheduleBooking", back_populates="assignments")
     worker = relationship("Worker", back_populates="assignments")
 
     def to_dict(self):
@@ -327,9 +337,10 @@ def create_tables():
                     conn.execute(text("UPDATE workers SET specializations = 'general' WHERE specializations IS NULL OR specializations = ''"))
 
                     
-                    # Status migration
-                    conn.execute(text("UPDATE job_assignments SET status = 'claimed' WHERE status = 'accepted'"))
-                    conn.execute(text("UPDATE schedule_bookings SET status = 'confirmed' WHERE status = 'accepted'"))
+                    # Worker Prefs Migration
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS notif_prefs TEXT"))
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS sched_prefs TEXT"))
+                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS privacy_prefs TEXT"))
                     
                     conn.commit()
                 except Exception as e:

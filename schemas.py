@@ -61,6 +61,9 @@ class WorkerProfileUpdate(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     specializations: Optional[List[str]] = None
+    notif_prefs: Optional[dict] = None
+    sched_prefs: Optional[dict] = None
+    privacy_prefs: Optional[dict] = None
 
 class WorkerSlotCreate(BaseModel):
     slot_date: str
