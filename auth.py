@@ -15,7 +15,12 @@ from database import get_db, Worker, AdminUser, User
 
 import bcrypt
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "cr-change-this-secret-in-production-2024")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    # In development, we can fallback, but we should warn the user.
+    # In production, this should be a mandatory environment variable.
+    SECRET_KEY = "dev-secret-change-me-in-production"
+    print("WARNING: JWT_SECRET_KEY not set. Using insecure default for development.")
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 24
 

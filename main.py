@@ -6,7 +6,7 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 import openai
@@ -15,6 +15,7 @@ from database import (
     get_db, create_tables,
     User, ScheduleBooking, ChatSession, ChatMessage,
     Worker, AdminUser, JobAssignment, WorkerSlot, SessionLocal,
+    OTPVerification, WorkerCancellation
 )
 from auth import (
     hash_password, verify_password, create_token,
@@ -25,7 +26,8 @@ from schemas import *
 from utils import (
     segment_to_2h, generate_customer_id, extract_required_skills,
     parse_time_to_minutes, does_worker_match_time, redact_assignment,
-    SYSTEM_PROMPT, get_fallback_reply
+    SYSTEM_PROMPT, get_fallback_reply,
+    generate_otp, send_otp_email
 )
 
 # App setup ───
@@ -38,21 +40,18 @@ app = FastAPI(
 
 # Robust CORS Configuration
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-_base_origins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:3002",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
-    "http://127.0.0.1:3002",
-    "https://custom-repair-workers.vercel.app",
-    "https://custom-repair-frontend.vercel.app",
-    "https://custom-repair-admin.vercel.app",
-    "https://custom-repair-client.vercel.app",
-]
-ALLOWED_ORIGINS: list[str] = list(dict.fromkeys(
-    [o.strip() for o in _raw_origins.split(",") if o.strip()] + _base_origins
-))
+if _raw_origins:
+    ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    # Development fallbacks
+    ALLOWED_ORIGINS = [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3002",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
@@ -151,12 +150,22 @@ def get_public_slots(
         Worker.is_active == True,
         Worker.is_available == True
     )
-    
     # Simple skill matching
     if service:
         required = extract_required_skills(service)
         for skill in required:
             query = query.filter(Worker.specializations.contains(skill))
+
+    # Filter for future dates (next 60 days)
+    now = datetime.utcnow()
+    today_date_str = now.date().isoformat()
+    future_date_str = (now + timedelta(days=60)).date().isoformat()
+    current_time_mins = now.hour * 60 + now.minute
+    
+    query = query.filter(
+        WorkerSlot.slot_date >= today_date_str,
+        WorkerSlot.slot_date <= future_date_str
+    )
 
     slots = query.all()
     
@@ -166,6 +175,13 @@ def get_public_slots(
 
     for s in slots:
         for window in segment_to_2h(s.start_time, s.end_time):
+            # If it's today, skip windows that have already started or are about to start
+            if s.slot_date == today_date_str:
+                win_start_time = window.split(" – ")[0]
+                win_start_mins = parse_time_to_minutes(win_start_time)
+                if win_start_mins < current_time_mins + 30: # 30 min buffer
+                    continue
+
             key = (s.slot_date, window)
             if key not in seen_windows:
                 result[s.slot_date].append({"id": s.id, "time": window})
@@ -286,6 +302,138 @@ def perform_auto_allocation(db: Session, booking: ScheduleBooking, exclude_worke
     return best["worker"], best["slot"]
 
 
+# ─── OTP Verification ──────────────────────────────────────────
+
+@app.post("/api/otp/request")
+def request_otp(payload: OTPRequest, db: Session = Depends(get_db)):
+    """Generate a 6-digit code and send to user's Gmail."""
+    otp_code = generate_otp()
+    
+    # Save to database with configurable expiry
+    expiry_mins = int(os.getenv("OTP_EXPIRY_MINUTES", "10"))
+    expiry = datetime.utcnow() + timedelta(minutes=expiry_mins)
+    otp_entry = OTPVerification(
+        email=payload.email,
+        code=otp_code,
+        expires_at=expiry
+    )
+    db.add(otp_entry)
+    db.commit()
+
+    # Send the actual email
+    success = send_otp_email(payload.email, otp_code)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to send OTP email. Please try again later.")
+        
+    return {"success": True, "message": f"Verification code sent to {payload.email}"}
+
+@app.post("/api/otp/verify")
+def verify_otp_endpoint(email: str, code: str, db: Session = Depends(get_db)):
+    """Manually verify a code before booking."""
+    otp_entry = db.query(OTPVerification).filter(
+        OTPVerification.email == email,
+        OTPVerification.code == code,
+        OTPVerification.is_verified == False,
+        OTPVerification.expires_at > datetime.utcnow()
+    ).order_by(OTPVerification.created_at.desc()).first()
+
+    if not otp_entry:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+
+    otp_entry.is_verified = True
+    db.commit()
+    return {"success": True, "message": "Email verified successfully."}
+
+
+# ─── Customer Authentication (Login/Signup via OTP) ──────────
+
+@app.post("/api/customer/auth/request")
+def customer_auth_request(payload: OTPRequest, db: Session = Depends(get_db)):
+    """Request a login/signup code."""
+    otp_code = generate_otp()
+    expiry = datetime.utcnow() + timedelta(minutes=10)
+    
+    otp_entry = OTPVerification(
+        email=payload.email,
+        code=otp_code,
+        expires_at=expiry
+    )
+    db.add(otp_entry)
+    db.commit()
+    
+    success = send_otp_email(payload.email, otp_code)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to send verification email.")
+        
+    return {"success": True, "message": f"Login code sent to {payload.email}"}
+
+@app.post("/api/customer/auth/verify")
+def customer_auth_verify(payload: AuthVerifyRequest, db: Session = Depends(get_db)):
+    """Verify code and return a persistent JWT token."""
+    otp_entry = db.query(OTPVerification).filter(
+        OTPVerification.email == payload.email,
+        OTPVerification.code == payload.code,
+        OTPVerification.expires_at > datetime.utcnow()
+    ).order_by(OTPVerification.created_at.desc()).first()
+    
+    if not otp_entry:
+        raise HTTPException(status_code=400, detail="Invalid or expired code.")
+    
+    # Mark as verified
+    otp_entry.is_verified = True
+    
+    # Find or create user
+    user = db.query(User).filter(User.email == payload.email).first()
+    if not user:
+        user = User(
+            customer_id=generate_customer_id(db),
+            email=payload.email,
+            name=payload.name or payload.email.split('@')[0],
+            phone=payload.phone,
+            address=payload.address,
+            password_hash=hash_password(payload.password) if payload.password else None
+        )
+        db.add(user)
+        db.flush()
+    else:
+        # Update profile if provided
+        if payload.name: user.name = payload.name
+        if payload.phone: user.phone = payload.phone
+        if payload.address: user.address = payload.address
+        if payload.password: user.password_hash = hash_password(payload.password)
+    
+    db.commit()
+    
+    # Generate persistent token
+    token = create_token(sub=user.id, user_type="customer")
+    
+    return {
+        "success": True,
+        "token": token,
+        "user": user.to_dict()
+    }
+
+@app.post("/api/customer/login")
+def customer_login(payload: CustomerLoginRequest, db: Session = Depends(get_db)):
+    """Password-only login for existing customers."""
+    user = db.query(User).filter(User.email == payload.email).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="Invalid email or account deactivated.")
+    
+    if not user.password_hash:
+         raise HTTPException(status_code=400, detail="Account requires OTP verification first. Please use Signup.")
+
+    if not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid password.")
+    
+    token = create_token(sub=user.id, user_type="customer")
+    return {
+        "success": True,
+        "token": token,
+        "user": user.to_dict()
+    }
+
+
 # ─── Schedule Booking API ─────────────────────────────────
 
 @app.post("/api/schedule")
@@ -298,6 +446,22 @@ def create_booking(
     
     # Find or create customer
     user = current
+    
+    # 1. Verification Check (Optional but recommended)
+    # If an OTP is provided, we verify it here
+    if payload.otp:
+        otp_entry = db.query(OTPVerification).filter(
+            OTPVerification.email == payload.email,
+            OTPVerification.code == payload.otp,
+            OTPVerification.expires_at > datetime.utcnow()
+        ).order_by(OTPVerification.created_at.desc()).first()
+        
+        if not otp_entry:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+        
+        otp_entry.is_verified = True
+        db.commit()
+    
     if not user:
         user = db.query(User).filter(User.email == payload.email).first()
     if user:
@@ -338,10 +502,10 @@ def create_booking(
     if worker:
         # Success: Assign job and auto-claim
         assignment.worker_id = worker.id
-        assignment.status = "claimed"
+        assignment.status = "assigned"
         assignment.assigned_at = datetime.utcnow()
         assignment.accepted_at = datetime.utcnow()
-        booking.status = "confirmed"
+        booking.status = "assigned"
     else:
         # ABSOLUTELY NO ONE has the shift: Remains pending for Admin review
         booking.status = "pending"
@@ -351,11 +515,16 @@ def create_booking(
     db.refresh(booking)
     db.refresh(assignment)
 
+    # Create Auth Token for the user so they can access their dashboard immediately
+    token = create_token(sub=user.id, user_type="customer")
+
     return {
         "success": True,
+        "message": "Booking successful",
         "booking_id": booking.id,
         "customer_id": user.customer_id,
-        "message": f"Booking received for {user.name} (Ref: {user.customer_id}). We'll call you at {user.phone} shortly.",
+        "token": token,
+        "user": user.to_dict()
     }
 
 
@@ -635,19 +804,39 @@ def update_job_status(
         if booking:
             booking.status = "confirmed"
     elif new_status == "rejected":
-        # Attempt to auto-allocate to someone else, allowing overbooking as an emergency fallback
-        exclude = [current.id]
+        # 1. Record the cancellation
+        cancellation = WorkerCancellation(
+            booking_id=assignment.booking_id,
+            worker_id=current.id,
+            reason=payload.notes or "No reason provided"
+        )
+        db.add(cancellation)
+        db.flush()
+
+        # 2. Get all workers who have already canceled this job
+        cancelled_workers = db.query(WorkerCancellation.worker_id).filter(
+            WorkerCancellation.booking_id == assignment.booking_id
+        ).all()
+        exclude = [w[0] for w in cancelled_workers]
+
+        # 3. Attempt to auto-allocate to someone else
         booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
         worker, slot = perform_auto_allocation(db, booking, exclude_worker_ids=exclude, allow_overbooking=True)
+        
         if worker:
             assignment.worker_id = worker.id
             assignment.status = "assigned" 
             assignment.assigned_at = now
             assignment.accepted_at = None
         else:
-            assignment.worker_id = None
-            assignment.status = "pending"
-            assignment.assigned_at = None
+            # POINT 3: If no other workers are available, PREVENT cancellation
+            # In a real scenario, we might allow it but alert admin, 
+            # but user requested to "prevent further cancellation"
+            db.rollback() # Don't save the cancellation
+            raise HTTPException(
+                status_code=403, 
+                detail="Cannot cancel this job: You are the only eligible technician available. Please contact support."
+            )
     elif new_status == "in_progress":
         assignment.started_at = now
         booking = db.query(ScheduleBooking).filter(ScheduleBooking.id == assignment.booking_id).first()
@@ -1047,12 +1236,18 @@ def send_chat_message(payload: ChatMessageRequest, db: Session = Depends(get_db)
         db.add(session)
         db.commit()
 
-    user_msg = ChatMessage(
-        session_id=session.id, role="user",
-        content=payload.message, category=payload.category,
+    msg_obj = ChatMessage(
+        session_id=session.id, 
+        role=payload.role or "user",
+        content=payload.message, 
+        category=payload.category,
     )
-    db.add(user_msg)
-    db.flush()
+    db.add(msg_obj)
+    db.commit()
+
+    # If it's an assistant message being logged, just return
+    if payload.role == "assistant":
+        return {"success": True, "message": msg_obj.to_dict()}
 
     history = (
         db.query(ChatMessage)
