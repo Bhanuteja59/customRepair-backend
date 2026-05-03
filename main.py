@@ -383,8 +383,9 @@ def customer_login(payload: CustomerLoginRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=401, detail="Invalid email or account deactivated.")
     
     if not user.password_hash:
-         raise HTTPException(status_code=400, detail="Account requires OTP verification first. Please use Signup.")
-
+        # Auto-set password on first login for users who were created via booking
+        user.password_hash = hash_password(payload.password)
+        db.commit()
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid password.")
     
