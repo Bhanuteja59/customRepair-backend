@@ -14,7 +14,7 @@ import openai
 from database import (
     get_db, create_tables,
     User, ScheduleBooking, ChatSession, ChatMessage,
-    Worker, AdminUser, JobAssignment, WorkerSlot, SessionLocal,
+    Worker, AdminUser, JobAssignment, WorkerSlot,
     OTPVerification, WorkerCancellation
 )
 from auth import (
@@ -94,44 +94,6 @@ async def global_exception_handler(request, exc):
     )
 
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
-
-def run_expiry_check():
-    """Mark assigned/claimed jobs as expired if their time window has passed."""
-    db = SessionLocal()
-    try:
-        now = datetime.now()
-        expired_candidates = (
-            db.query(JobAssignment)
-            .filter(JobAssignment.status.in_(["assigned", "claimed"]))
-            .all()
-        )
-        for a in expired_candidates:
-            if not a.booking:
-                continue
-            try:
-                date_str = a.booking.preferred_date
-                time_str = a.booking.preferred_time
-                if not date_str:
-                    continue
-                if not time_str or any(x in time_str.lower() for x in ["flex", "asap"]):
-                    end_dt = datetime.strptime(f"{date_str} 11:59 PM", "%Y-%m-%d %I:%M %p")
-                else:
-                    end_part = time_str
-                    for sep in [" – ", " — ", "–", "—", " - ", "-"]:
-                        if sep in time_str:
-                            end_part = time_str.split(sep)[-1].strip()
-                            break
-                    end_dt = datetime.strptime(f"{date_str} {end_part}", "%Y-%m-%d %I:%M %p")
-                if now > end_dt:
-                    a.status = "expired"
-                    a.booking.status = "overdue"
-                    db.commit()
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"Database error in expiry check: {e}")
-    finally:
-        db.close()
 
 
 # ─── Public Availability API ──────────────────────────────
@@ -528,43 +490,7 @@ def create_booking(
     }
 
 
-# ─── Customer Auth & Dashboard ──────────────────────────
-
-@app.post("/api/auth/signup")
-def customer_signup(payload: CustomerSignupRequest, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == payload.email).first():
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    user = User(
-        customer_id=generate_customer_id(db),
-        name=payload.name,
-        email=payload.email,
-        phone=payload.phone,
-        password_hash=hash_password(payload.password),
-        address=payload.address
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    
-    token = create_token(user.id, "customer", "user")
-    return {"access_token": token, "token_type": "bearer", "user": user.to_dict()}
-
-
-@app.post("/api/auth/login")
-def customer_login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
-    if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    
-    token = create_token(user.id, "customer", "user")
-    return {"access_token": token, "token_type": "bearer", "user": user.to_dict()}
-
-
-@app.get("/api/auth/me")
-def customer_me(current: User = Depends(get_current_customer)):
-    return current.to_dict()
-
+# ─── Customer Dashboard ─────────────────────────────────
 
 @app.get("/api/customer/dashboard")
 def get_customer_dashboard(current: User = Depends(get_current_customer), db: Session = Depends(get_db)):
