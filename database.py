@@ -18,12 +18,18 @@ import json
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/customrepair")
 
-engine = create_engine(
-    DATABASE_URL, 
-    pool_pre_ping=True,
-    pool_recycle=300, # Recycle connections every 5 minutes (well within Neon's limits)
-    connect_args={"connect_timeout": 10}
-)
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        DATABASE_URL, 
+        connect_args={"check_same_thread": False}
+    )
+else:
+    engine = create_engine(
+        DATABASE_URL, 
+        pool_pre_ping=True,
+        pool_recycle=300, # Recycle connections every 5 minutes (well within Neon's limits)
+        connect_args={"connect_timeout": 10}
+    )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -57,7 +63,7 @@ class User(Base):
     customer_id = Column(String(20), unique=True, nullable=False)  # e.g. CR-1001
     name = Column(String(200), nullable=False)
     email = Column(String(200), unique=True, nullable=False, index=True)
-    phone = Column(String(50), nullable=False)
+    phone = Column(String(50), nullable=True)
     address = Column(Text, nullable=True)
     password_hash = Column(String(300), nullable=True) # Optional for now to keep existing users working
     is_active = Column(Boolean, default=True)
@@ -274,6 +280,16 @@ class JobAssignment(Base):
             "booking": self.booking.to_dict() if self.booking else None,
         }
 
+class WorkerCancellation(Base):
+    """Tracks which workers have canceled a specific booking to avoid reassignment loops."""
+    __tablename__ = "worker_cancellations"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    booking_id = Column(String(36), ForeignKey("schedule_bookings.id"), nullable=False)
+    worker_id = Column(String(36), ForeignKey("workers.id"), nullable=False)
+    reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 # ─── Worker Availability Slots ─────────────────────────────
 
@@ -312,10 +328,23 @@ class WorkerSlot(Base):
                 res["client_name"] = self.booking.user.name
         return res
 
+class OTPVerification(Base):
+    """Stores temporary 6-digit codes for email verification."""
+    __tablename__ = "otp_verifications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(200), nullable=False, index=True)
+    code = Column(String(10), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    is_verified = Column(Boolean, default=False)
 
 
 def create_tables():
-    """Create all tables and perform simple migrations if needed with retries."""
+    """
+    Initializes database tables. In production, use Alembic migrations:
+    'alembic upgrade head'
+    """
     import time
     max_retries = 5
     retry_delay = 2
@@ -323,41 +352,7 @@ def create_tables():
     for attempt in range(max_retries):
         try:
             Base.metadata.create_all(bind=engine)
-            print("Database tables created/verified.")
-            
-            # Simple migration: add password_hash to users if missing
-            from sqlalchemy import text
-            with engine.connect() as conn:
-                try:
-                    # Users migrations
-                    conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(300)"))
-                    conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
-                    
-                    # Workers migrations
-                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS password_hash VARCHAR(300)"))
-                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
-                    
-                    # Admin migrations
-                    conn.execute(text("ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(300)"))
-                    conn.execute(text("ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
-
-                    # Specialization to multi-skill migration
-                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS specializations VARCHAR(200)"))
-                    # If specializations is null but old specialization exists, migrate it
-                    conn.execute(text("UPDATE workers SET specializations = specialization WHERE (specializations IS NULL OR specializations = '') AND specialization IS NOT NULL"))
-                    conn.execute(text("UPDATE workers SET specializations = 'general' WHERE specializations IS NULL OR specializations = ''"))
-
-                    
-                    # Worker Prefs Migration
-                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS notif_prefs TEXT"))
-                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS sched_prefs TEXT"))
-                    conn.execute(text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS privacy_prefs TEXT"))
-                    
-                    conn.commit()
-                except Exception as e:
-                    print(f"Migration note: {e}")
-                    pass 
-            # If we reached here, everything is good
+            print("Database tables initialized.")
             return
         except Exception as e:
             if attempt < max_retries - 1:

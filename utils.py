@@ -1,8 +1,16 @@
+import secrets
+import smtplib
+import ssl
+import os
 import copy
+from email.message import EmailMessage
 from datetime import datetime, timedelta
 from typing import List, Optional
 from sqlalchemy.orm import Session
 from database import User, WorkerSlot
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def segment_to_2h(start_str: str, end_str: str):
     """
@@ -24,9 +32,18 @@ def segment_to_2h(start_str: str, end_str: str):
         yield f"{start_str} – {end_str}"
 
 def generate_customer_id(db: Session):
-    from sqlalchemy import func
-    count = db.query(User).count()
-    return f"CR-{1001 + count}"
+    import random
+    import string
+    
+    while True:
+        # Generate a 6-character random alphanumeric code (e.g., 7H2X9P)
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        customer_id = f"CR-{code}"
+        
+        # Ensure uniqueness in the database
+        exists = db.query(User).filter(User.customer_id == customer_id).first()
+        if not exists:
+            return customer_id
 
 def extract_required_skills(service: str) -> List[str]:
     """Identify ALL required skills for a booking based on keywords (Multi-trade support)."""
@@ -39,10 +56,53 @@ def extract_required_skills(service: str) -> List[str]:
     if "electr" in s:
         required.append("electrical")
     
-    # If no specialty detected, default to general
     if not required:
         required.append("general")
     return required
+
+def generate_otp() -> str:
+    """Generate a 6-digit numeric OTP."""
+    return "".join(secrets.choice("0123456789") for _ in range(6))
+
+def send_otp_email(receiver_email: str, otp: str):
+    """Send OTP via Gmail SMTP."""
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+
+    if not smtp_user or not smtp_pass:
+        print("⚠️ SMTP credentials missing. OTP email not sent.")
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = "Custom Repair Verification Code"
+    msg["From"] = smtp_user
+    msg["To"] = receiver_email
+    msg.set_content(f"""
+Hello!
+
+We received a request to verify your email for Custom Repair. Your secure verification code is:
+
+{otp}
+
+This code will expire in 10 minutes. 
+
+If you did not request this code, you can safely ignore this email.
+
+Best regards,
+The Custom Repair Team
+    """)
+
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"❌ Failed to send email: {e}")
+        return False
 
 def parse_time_to_minutes(time_str: str) -> int:
     """Converts '09:00 AM' to minutes from midnight."""

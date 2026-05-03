@@ -11,6 +11,7 @@ class ScheduleRequest(BaseModel):
     time: Optional[str] = None
     notes: Optional[str] = None
     slot_id: Optional[str] = None
+    otp: Optional[str] = None
 
 class ChatSessionCreate(BaseModel):
     category: str
@@ -20,6 +21,7 @@ class ChatMessageRequest(BaseModel):
     session_id: str
     message: str
     category: Optional[str] = None
+    role: Optional[str] = "user"
 
 class WorkerSignupRequest(BaseModel):
     name: str
@@ -69,3 +71,18 @@ class WorkerSlotCreate(BaseModel):
     slot_date: str
     start_time: str
     end_time: str
+
+class OTPRequest(BaseModel):
+    email: EmailStr
+
+class AuthVerifyRequest(BaseModel):
+    email: EmailStr
+    code: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    password: Optional[str] = None
+
+class CustomerLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
