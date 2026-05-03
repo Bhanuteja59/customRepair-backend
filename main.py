@@ -312,6 +312,11 @@ def verify_otp_endpoint(email: str, code: str, db: Session = Depends(get_db)):
 @app.post("/api/customer/auth/request")
 def customer_auth_request(payload: OTPRequest, db: Session = Depends(get_db)):
     """Request a login/signup code."""
+    # Prevent re-signup if user already has a fully registered account
+    user = db.query(User).filter(User.email == payload.email).first()
+    if user and user.password_hash:
+        raise HTTPException(status_code=400, detail="Account already exists. Please log in instead.")
+
     otp_code = generate_otp()
     expiry = datetime.utcnow() + timedelta(minutes=10)
     
