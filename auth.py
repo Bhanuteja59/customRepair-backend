@@ -110,7 +110,7 @@ def get_optional_customer(
             return None
         user = db.query(User).filter(User.id == payload["sub"]).first()
         return user if user and user.is_active else None
-    except:
+    except Exception:
         return None
 
 

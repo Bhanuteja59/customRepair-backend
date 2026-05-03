@@ -30,13 +30,6 @@ class WorkerSignupRequest(BaseModel):
     password: str
     specializations: List[str] = ["general"]
 
-class CustomerSignupRequest(BaseModel):
-    name: str
-    email: EmailStr
-    phone: str
-    password: str
-    address: Optional[str] = None
-
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
