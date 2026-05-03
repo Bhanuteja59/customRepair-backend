@@ -320,7 +320,7 @@ def customer_auth_request(payload: OTPRequest, db: Session = Depends(get_db)):
     otp_code = generate_otp()
     expiry = datetime.utcnow() + timedelta(minutes=10)
     
-    otp_entry = OTPVerification(
+    otp_entry = OTPVerification(  
         email=payload.email,
         code=otp_code,
         expires_at=expiry
